@@ -4,7 +4,6 @@ import numpy as np
 import tensorflow as tf
 import requests
 import ccxt
-import re
 from dotenv import load_dotenv
 from urllib.parse import urlencode
 import hashlib
@@ -20,7 +19,8 @@ import json
 import pandas as pd
 from websocket import WebSocketApp
 import tweepy
-import random
+import ta
+
 
 
 # Download VADER model
@@ -34,6 +34,7 @@ load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET_KEY")
 CRYPTO_PANIC_API_KEY = os.getenv("CRYPTO_PANIC_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
 # Twitter API credentials (Ensure you have a valid Twitter Developer API Key)
 TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
@@ -56,6 +57,8 @@ binance = ccxt.binance({
 })
 binance.load_markets()
 
+open_trades = {}
+
 def get_whale_exchange_flows(symbol="BTCUSDT"):
     try:
         endpoint = "https://api.binance.com/api/v3/ticker/24hr"
@@ -63,8 +66,6 @@ def get_whale_exchange_flows(symbol="BTCUSDT"):
 
         inflow = float(response["quoteVolume"])  # Total USDT volume traded in 24h
         buy_volume = float(response["volume"])   # Total BTC volume traded in 24h
-
-        print(f"📊 BTC Exchange Volume: {inflow:.2f} USDT | Buy Volume: {buy_volume:.4f} BTC")
         return inflow, buy_volume
 
     except Exception as e:
@@ -74,27 +75,84 @@ def get_whale_exchange_flows(symbol="BTCUSDT"):
 
 def get_news_sentiment():
     try:
+        categories = ["hot", "bullish", "bearish", "news", "media"]
         total_sentiment = 0
         news_count = 0
 
-        # ✅ Fetch news from CryptoPanic
-        response = requests.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_API_KEY}&filter=hot").json()
+        for category in categories:
+            response = requests.get(
+                f"https://cryptopanic.com/api/v1/posts/?auth_token={CRYPTO_PANIC_API_KEY}&filter={category}"
+            ).json()
 
-        for news in response['results']:
-            title = news['title'].lower()
-            sentiment_score = sia.polarity_scores(title)["compound"]  # AI Sentiment Analysis
-            total_sentiment += sentiment_score
-            news_count += 1
+            for news in response.get("results", []):
+                title = news["title"].lower()
+                sentiment_score = sia.polarity_scores(title)["compound"]
+                total_sentiment += sentiment_score
+                news_count += 1
 
-        # ✅ Compute average sentiment score
-        avg_sentiment = total_sentiment / news_count if news_count > 0 else 0
-
-        print(f"📰 News Sentiment Score (CryptoPanic): {avg_sentiment:.2f}")
+        avg_sentiment = round(total_sentiment / news_count, 2) if news_count > 0 else np.nan
         return avg_sentiment
 
     except Exception as e:
         print(f"❌ Error Fetching News Sentiment: {e}")
-        return 0  # Default to neutral if error occurs
+        return np.nan
+
+def get_reddit_sentiment():
+    try:
+        url = "https://www.reddit.com/r/cryptocurrency/top/.json?limit=10"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers).json()
+
+        total_sentiment = 0
+        post_count = 0
+
+        for post in response["data"]["children"]:
+            title = post["data"]["title"].lower()
+            sentiment_score = sia.polarity_scores(title)["compound"]
+            total_sentiment += sentiment_score
+            post_count += 1
+
+        avg_sentiment = round(total_sentiment / post_count, 2) if post_count > 0 else np.nan
+        return avg_sentiment
+
+    except Exception as e:
+        print(f"❌ Error Fetching Reddit Sentiment: {e}")
+        return np.nan
+
+def get_combined_news_sentiment():
+    cryptopanic_score = get_news_sentiment()
+    newsapi_score = get_news_sentiment_newsapi()
+    reddit_score = get_reddit_sentiment()
+
+    sentiment_scores = [cryptopanic_score, newsapi_score, reddit_score]
+    sentiment_scores = [score for score in sentiment_scores if not np.isnan(score)]
+
+    avg_sentiment = round(sum(sentiment_scores) / len(sentiment_scores), 2) if sentiment_scores else np.nan
+    print(f"🔹 Combined Multi-Source Sentiment Score: {avg_sentiment}")
+    return avg_sentiment
+
+
+def get_news_sentiment_newsapi():
+    try:
+        url = f"https://newsapi.org/v2/everything?q=crypto&apiKey={NEWS_API_KEY}"
+        response = requests.get(url).json()
+
+        total_sentiment = 0
+        news_count = 0
+
+        for article in response.get("articles", []):
+            title = article["title"].lower()
+            sentiment_score = sia.polarity_scores(title)["compound"]
+            total_sentiment += sentiment_score
+            news_count += 1
+
+        avg_sentiment = round(total_sentiment / news_count, 2) if news_count > 0 else np.nan
+        return avg_sentiment
+
+    except Exception as e:
+        print(f"❌ Error Fetching NewsAPI Sentiment: {e}")
+        return np.nan
+
 
     
 # Function to generate Binance API signature
@@ -103,7 +161,7 @@ def generate_signature(params):
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
 def get_fundamental_score():
-    news_sentiment = get_news_sentiment()
+    news_sentiment = get_combined_news_sentiment()
     exchange_inflow, buy_volume = get_whale_exchange_flows()  # ✅ New Whale Tracking
     funding_rate, open_interest = get_funding_rate()
 
@@ -139,7 +197,7 @@ def get_funding_rate(symbol="BTCUSDT"):
     try:
         response = requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex", params={"symbol": symbol}).json()
         
-        funding_rate = float(response["lastFundingRate"])
+        funding_rate = round(float(response["lastFundingRate"]), 6)
         open_interest = float(response.get("openInterest", 0))
 
         print(f"📊 Funding Rate: {funding_rate:.4f} | Open Interest: {open_interest:.2f}")
@@ -149,6 +207,189 @@ def get_funding_rate(symbol="BTCUSDT"):
         print(f"❌ Error Fetching Funding Rate: {e}")
         return 0, 0
 
+def get_fibonacci_levels(symbol="BTCUSDT"):
+    """Calculate Fibonacci retracement levels based on recent high and low."""
+    binance_symbol = symbol.replace("/", "")
+    endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/24hr"
+
+    try:
+        response = requests.get(endpoint, params={"symbol": binance_symbol}).json()
+        low_price = float(response["lowPrice"])   # 24-hour lowest price
+        high_price = float(response["highPrice"])  # 24-hour highest price
+
+        # Calculate Fibonacci levels
+        diff = high_price - low_price
+        fib_levels = {
+            "0.236": high_price - diff * 0.236,
+            "0.382": high_price - diff * 0.382,
+            "0.500": high_price - diff * 0.500,
+            "0.618": high_price - diff * 0.618,
+            "0.786": high_price - diff * 0.786
+        }
+
+        return fib_levels
+    except Exception as e:
+        print(f"❌ Error Fetching Fibonacci Levels: {e}")
+        return {"0.236": None, "0.382": None, "0.500": None, "0.618": None, "0.786": None}
+
+def get_sma_levels(symbol="BTCUSDT"):
+    """Fetch SMA 50 & SMA 200 from Binance OHLCV data."""
+    try:
+        endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
+        params = {"symbol": symbol.replace("/", ""), "interval": "1h", "limit": 200}  # Fetch 200 hours
+
+        response = requests.get(endpoint, params=params).json()
+        closes = np.array([float(entry[4]) for entry in response])  # Closing prices
+
+        # Calculate SMA 50 and SMA 200
+        sma_50 = np.mean(closes[-50:]) if len(closes) >= 50 else np.nan
+        sma_200 = np.mean(closes[-200:]) if len(closes) >= 200 else np.nan
+
+        return sma_50, sma_200
+    except Exception as e:
+        print(f"❌ Error Fetching SMA Levels: {e}")
+        return np.nan, np.nan
+
+def get_rsi(symbol="BTCUSDT"):
+    """Fetch RSI (Relative Strength Index) from OHLCV data."""
+    try:
+        endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
+        params = {"symbol": symbol.replace("/", ""), "interval": "1h", "limit": 100}  # Fetch 100 hours
+
+        response = requests.get(endpoint, params=params).json()
+        closes = pd.Series([float(entry[4]) for entry in response])  # Closing prices
+
+        # Compute RSI (14-period)
+        rsi = ta.momentum.RSIIndicator(closes, window=14).rsi().iloc[-1]
+        return round(rsi, 2)
+    except Exception as e:
+        print(f"❌ Error Fetching RSI: {e}")
+        return np.nan
+
+def get_optimal_entry(symbol="BTCUSDT", side="BUY"):
+    """Determine the best entry price using order book bid/ask prices, support/resistance, SMA, and RSI."""
+
+    # ✅ Fetch Order Book Data (Top Bid/Ask)
+    response = requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/depth", params={"symbol": symbol.replace("/", ""), "limit": 10}).json()
+    top_bid = float(response["bids"][0][0])  # Highest bid price (buyers)
+    top_ask = float(response["asks"][0][0])  # Lowest ask price (sellers)
+
+    # ✅ Fetch Support & Resistance Levels
+    support, resistance = get_support_resistance(symbol)
+
+    # ✅ Fetch SMA 50/200
+    sma_50, sma_200 = get_sma_levels(symbol)
+
+    # ✅ Fetch RSI
+    rsi = get_rsi(symbol)
+
+    # ✅ Base entry on bid/ask price
+    entry_price = top_bid if side == "BUY" else top_ask
+
+    # ✅ Prevent Buying at Resistance & Selling at Support
+    if side == "BUY" and entry_price >= resistance * 0.99:
+        print(f"⚠️ Skipping Trade: {symbol} is near resistance at {resistance:.2f}")
+        return None
+    if side == "SELL" and entry_price <= support * 1.01:
+        print(f"⚠️ Skipping Trade: {symbol} is near support at {support:.2f}")
+        return None
+
+    # ✅ Adjust Entry Based on SMA Trend
+    if side == "BUY" and sma_50 > sma_200:  # Uptrend
+        entry_price = min(entry_price, sma_50 * 0.995)  # Slight discount
+    elif side == "SELL" and sma_50 < sma_200:  # Downtrend
+        entry_price = max(entry_price, sma_50 * 1.005)  # Slight premium
+
+    # ✅ Adjust for RSI (Avoid Overbought/Oversold)
+    if side == "BUY" and rsi > 70:  # Overbought
+        print(f"⚠️ RSI Overbought ({rsi:.2f}), Avoiding BUY Entry")
+        return None
+    if side == "SELL" and rsi < 30:  # Oversold
+        print(f"⚠️ RSI Oversold ({rsi:.2f}), Avoiding SELL Entry")
+        return None
+
+    print(f"""
+    📊 Optimal Entry Calculation:
+    - 🏦 Order Book: Top Bid = {top_bid:.2f}, Top Ask = {top_ask:.2f}
+    - 🛑 Support Level: {support:.2f}, Resistance Level: {resistance:.2f}
+    - 📊 SMA 50: {sma_50:.2f}, SMA 200: {sma_200:.2f}
+    - 💡 RSI: {rsi:.2f}
+    - ✅ Final Suggested Entry Price: {entry_price:.2f} (Side: {side})
+    """)
+
+    return entry_price
+
+
+
+def get_order_status(symbol, order_id):
+    """Fetches the status of an existing order on Binance Futures."""
+    try:
+        headers = {"X-MBX-APIKEY": API_KEY}
+        params = {
+            "symbol": symbol.replace("/", ""),
+            "orderId": order_id,
+            "timestamp": int(time.time() * 1000)
+        }
+        params["signature"] = generate_signature(params)
+
+        response = requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=params)
+        order_data = response.json()
+
+        if response.status_code == 200:
+            return order_data["status"]  # Returns `NEW`, `FILLED`, `CANCELED`, etc.
+        else:
+            print(f"❌ Error Fetching Order Status: {order_data}")
+            return None
+    except Exception as e:
+        print(f"❌ Error Fetching Order Status for {symbol}: {e}")
+        return None
+
+def get_order_book_liquidity(symbol="BTCUSDT", depth=10):
+    """Fetches order book liquidity from Binance Futures and returns total volume."""
+    try:
+        response = requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/depth", params={"symbol": symbol.replace("/", ""), "limit": depth}).json()
+
+        # Sum up total volume for top `depth` levels
+        total_bid_volume = sum([float(entry[1]) for entry in response["bids"]])  # Buy side volume
+        total_ask_volume = sum([float(entry[1]) for entry in response["asks"]])  # Sell side volume
+        total_liquidity = total_bid_volume + total_ask_volume  # Overall market liquidity
+
+        print(f"📊 Market Liquidity | Bids: {total_bid_volume:.2f} | Asks: {total_ask_volume:.2f} | Total: {total_liquidity:.2f}")
+        return total_liquidity
+    except Exception as e:
+        print(f"❌ Error Fetching Order Book Liquidity: {e}")
+        return 0
+
+def check_unfilled_orders():
+    if not open_trades:
+        return
+
+    for symbol, trade in list(open_trades.items()):
+        if trade.get("trade_type") == "LIMIT":
+            order_status = get_order_status(symbol, trade["order_id"])
+
+            if order_status == "NEW":
+                new_predicted_price = predict_price_movement(symbol)
+                price_deviation = abs((new_predicted_price - trade["entry_price"]) / trade["entry_price"]) * 100
+
+                print(f"🔍 Checking {symbol} Limit Order | Entry: {trade['entry_price']} | New Prediction: {new_predicted_price:.2f} | Deviation: {price_deviation:.2f}%")
+
+                if price_deviation < 0.2:
+                    print(f"✅ Deviation {price_deviation:.2f}% is small, keeping existing order.")
+                    continue
+
+                elif 0.2 <= price_deviation <= 0.5:
+                    order_book_depth = get_order_book_liquidity(symbol)
+                    if order_book_depth > 500:
+                        print(f"📊 Liquidity High ({order_book_depth}), keeping order.")
+                        continue
+                    else:
+                        print(f"⚠️ Liquidity Low, adjusting order.")
+
+                print(f"⚠️ High Deviation {price_deviation:.2f}% detected, canceling old order.")
+                cancel_order(symbol, trade["order_id"])
+                del open_trades[symbol]  # ✅ Remove canceled trade
+                place_ai_trade(symbol)  # ✅ Recalculate & place new order
 
 # Function to determine market volatility and adjust trading frequency
 def get_market_volatility(symbol="BTC/USDT"):
@@ -215,6 +456,30 @@ def get_real_time_data(symbol="BTC/USDT"):
     normalized_features = (full_features - min_vals) / (max_vals - min_vals)
     
     return np.expand_dims(normalized_features, axis=0)
+
+def cancel_order(symbol, order_id):
+    """Cancels an open limit order and removes it from tracking."""
+    try:
+        headers = {"X-MBX-APIKEY": API_KEY}
+        cancel_params = {
+            "symbol": symbol.replace("/", ""),
+            "orderId": order_id,
+            "timestamp": int(time.time() * 1000)
+        }
+        cancel_params["signature"] = generate_signature(cancel_params)
+
+        response = requests.delete(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=cancel_params)
+        cancel_result = response.json()
+
+        if response.status_code == 200:
+            print(f"✅ Order {order_id} for {symbol} successfully canceled.")
+            if symbol in open_trades:
+                del open_trades[symbol]  # ✅ Remove from tracking
+        else:
+            print(f"❌ Failed to cancel order {order_id}: {cancel_result}")
+
+    except Exception as e:
+        print(f"❌ Error canceling order {order_id}: {e}")
 
 # Function to predict price movement using LSTM model
 def predict_price_movement(symbol="BTC/USDT"):
@@ -362,7 +627,6 @@ def get_open_trades(symbol="BTC/USDT"):
         return []
  
 def should_dca(symbol="BTC/USDT"):
-    open_trades = get_open_trades(symbol)
     if not open_trades:
         return False, 0  # No existing trade → No DCA needed
 
@@ -383,29 +647,6 @@ def should_dca(symbol="BTC/USDT"):
             return True, round(new_position_size, 6)  
 
     return False, 0  # Default to no DCA
-
-def monitor_trade(symbol="BTC/USDT", side="BUY", entry_price=0, stop_loss=0, take_profit=0, trade_type="regular"):
-    while True:
-        time.sleep(10)  # Check every 10 seconds
-
-        open_position = get_open_position(symbol)
-        if not open_position:
-            exit_price = float(requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/price", params={"symbol": symbol.replace("/", "")}).json()["price"])
-
-            # Determine if it hit SL or TP
-            if exit_price >= take_profit:
-                result = "WIN"
-                pnl = (take_profit - entry_price) * float(open_position["positionAmt"]) if side == "BUY" else (entry_price - take_profit) * float(open_position["positionAmt"])
-            elif exit_price <= stop_loss:
-                result = "LOSS"
-                pnl = (stop_loss - entry_price) * float(open_position["positionAmt"]) if side == "BUY" else (entry_price - stop_loss) * float(open_position["positionAmt"])
-            else:
-                result = "CLOSED MANUALLY"
-                pnl = (exit_price - entry_price) * float(open_position["positionAmt"]) if side == "BUY" else (entry_price - exit_price) * float(open_position["positionAmt"])
-
-            # ✅ Log the closed trade
-            log_trade(symbol, side, float(open_position["positionAmt"]), entry_price, stop_loss, take_profit, exit_price, result, pnl, trade_type)
-            break  # Exit loop when trade is closed
 
 def is_profitable_setup(symbol="BTC/USDT", side="BUY"):
     try:
@@ -521,88 +762,94 @@ def get_trade_confidence(symbol="BTC/USDT"):
 
 
 # Function to place an AI-driven trade with corrected trade direction
-def place_ai_trade(symbol="BTC/USDT", leverage=10):
+def place_ai_trade(symbol="BTC/USDT"):
     predicted_price, current_price = predict_price_movement(symbol)
-    sentiment_score = get_news_sentiment()
+    sentiment_score = get_combined_news_sentiment()
     support, resistance = get_support_resistance(symbol)
 
     if sentiment_score < 0:
         print("⚠️ FA Signals Bearish Market, Skipping Trade")
         return
 
-    # ✅ Fix: Ensure the bot places the correct order type
-    if predicted_price > current_price:  # AI predicts bullish move
+    if predicted_price > current_price:
         side = "BUY"
-        position_side = "LONG"  # Hedge mode requires positionSide
-    else:  # AI predicts bearish move
+        position_side = "LONG"
+    else:
         side = "SELL"
         position_side = "SHORT"
-    
-    if side == "BUY" and current_price >= resistance * 0.99:  # Near resistance
+
+    if side == "BUY" and current_price >= resistance * 0.99:
         print(f"⚠️ Skipping Trade: {symbol} is near resistance at {resistance:.2f}")
         return
-    if side == "SELL" and current_price <= support * 1.01:  # Near support
+    if side == "SELL" and current_price <= support * 1.01:
         print(f"⚠️ Skipping Trade: {symbol} is near support at {support:.2f}")
         return
-    
+
     if not is_profitable_setup(symbol, side):
         print(f"⚠️ Skipping Trade: Similar setups had <60% win rate")
         return
-    
+
     confidence = get_trade_confidence(symbol)
     if confidence < 75:
         print(f"⚠️ Skipping Trade: Confidence too low ({confidence}%)")
         return
 
-    open_trades = get_open_trades(symbol)
     should_dca_now, dca_size = should_dca(symbol)
 
     if open_trades and not should_dca_now:
         print(f"⚠️ Skipping Trade: Already an Open Position for {symbol}")
-        return False, 0  # No
-    
+        return False, 0
+
     inflow, buy_volume = get_whale_exchange_flows()
 
     print(f"""
     📊 Market Analysis:
-    - 🔹 Total Exchange Inflow: ${inflow:,.2f} USDT
-    - 🔹 BTC Buy Volume: {buy_volume:.2f} BTC
+    - Trade Confidence {confidence:,.2f}
     - 🔹 Whale Activity: {"HIGH" if buy_volume > 10_000 else "LOW"}
     """)
-    
+
     position_size = dca_size if should_dca_now else get_trade_size(symbol)
     stop_loss, take_profit = get_dynamic_sl_tp(symbol, current_price, side)
-    
+
     if stop_loss is None or take_profit is None:
         print(f"❌ Error: Stop-Loss or Take-Profit calculation failed. Skipping trade.")
         return
 
-    print(f"🚀 AI Trading Signal: {side} | Order Amount: {position_size:.6f} BTC | SL: {stop_loss:.2f} | TP: {take_profit:.2f} | Mode: Hedge")
+    # ✅ Get Optimal Entry Price Using Order Book Data
+    entry_price = get_optimal_entry(symbol)
+
+    order_type = "LIMIT"
+
+    print(f"🚀 AI Trading Signal: {side} | Order Amount: {position_size:.6f} BTC | Entry Price: {entry_price:.2f} | SL: {stop_loss:.2f} | TP: {take_profit:.2f} | Mode: Hedge")
 
     headers = {"X-MBX-APIKEY": API_KEY}
 
-    # Step 1: Place Market Order First
-    market_order_params = {
+    # ✅ Step 1: Place Limit Order
+    limit_order_params = {
         "symbol": symbol.replace("/", ""),
         "side": side.upper(),
-        "type": "MARKET",
+        "type": order_type,
+        "price": entry_price,
         "quantity": position_size,
-        "positionSide": position_side,  # ✅ Required in Hedge Mode
+        "timeInForce": "GTC", 
+        "positionSide": position_side,
         "timestamp": int(time.time() * 1000)
     }
 
-    market_order_params["signature"] = generate_signature(market_order_params)
-    market_response = requests.post(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=market_order_params)
-    print(f"✅ Market Order Executed: {market_response.json()}")
+    limit_order_params["signature"] = generate_signature(limit_order_params)
+    limit_response = requests.post(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=limit_order_params)
+   
+    print(f"✅ Limit Order Sent: {limit_response.json()}")
 
-    if market_response.status_code == 200:
-        # Step 2: Place Stop-Loss Order
+    if limit_response.status_code == 200:
+        # ✅ Step 2: Place Stop-Loss Order
         sl_order_params = {
             "symbol": symbol.replace("/", ""),
             "side": "SELL" if side == "BUY" else "BUY",
             "type": "STOP_MARKET",
             "stopPrice": stop_loss,
-            "positionSide": position_side,  # ✅ Ensures SL is for the correct position
+            "timeInForce": "GTC", 
+            "positionSide": position_side,
             "closePosition": "true",
             "timestamp": int(time.time() * 1000)
         }
@@ -611,13 +858,14 @@ def place_ai_trade(symbol="BTC/USDT", leverage=10):
         sl_response = requests.post(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=sl_order_params)
         print(f"✅ Stop-Loss Order Executed: {sl_response.json()}")
 
-        # Step 3: Place Take-Profit Order
+        # ✅ Step 3: Place Take-Profit Order
         tp_order_params = {
             "symbol": symbol.replace("/", ""),
             "side": "SELL" if side == "BUY" else "BUY",
             "type": "TAKE_PROFIT_MARKET",
             "stopPrice": take_profit,
-            "positionSide": position_side,  # ✅ Ensures TP is for the correct position
+            "positionSide": position_side,
+            "timeInForce": "GTC", 
             "closePosition": "true",
             "timestamp": int(time.time() * 1000)
         }
@@ -625,36 +873,6 @@ def place_ai_trade(symbol="BTC/USDT", leverage=10):
         tp_order_params["signature"] = generate_signature(tp_order_params)
         tp_response = requests.post(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=tp_order_params)
         print(f"✅ Take-Profit Order Executed: {tp_response.json()}")
-        
-        if should_dca_now and open_trade:
-            old_position_size = open_trade["position_size"]
-            new_position_size = old_position_size + position_size  # Accumulate position
-
-            # Recalculate weighted average entry price
-            avg_entry_price = ((old_position_size * open_trade["entry_price"]) + (position_size * current_price)) / new_position_size
-
-            # Update Stop-Loss & Take-Profit dynamically
-            stop_loss, take_profit = get_dynamic_sl_tp(symbol, avg_entry_price, side)
-
-            open_trade.update({
-                "position_size": new_position_size,
-                "entry_price": avg_entry_price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit
-            })
-
-            print(f"🔄 DCA Applied: New Position Size = {new_position_size:.6f} BTC | New Entry Price = {avg_entry_price:.2f}")
-        
-        else:
-            # ✅ Register new trade in memory for real-time tracking
-            open_trades[symbol] = {
-                "side": side,
-                "position_size": position_size,
-                "entry_price": current_price,
-                "stop_loss": stop_loss,
-                "take_profit": take_profit,
-                "trade_type": trade_type
-            }
 
 def get_support_resistance(symbol="BTC/USDT", lookback=50):
     binance_symbol = symbol.replace("/", "")
@@ -690,7 +908,7 @@ def get_real_time_price(symbol="BTC/USDT"):
 
 def on_message(ws, message):
     data = json.loads(message)
-
+    
     if "e" in data and data["e"] == "ORDER_TRADE_UPDATE":
         symbol = data["o"]["s"]
         status = data["o"]["X"]  # Order status
@@ -728,4 +946,6 @@ trade_monitor_thread.start()
 while True:
     print("🔄 Checking Market for AI Trade Signal...")
     place_ai_trade()
+    """Periodically checks for unfilled limit orders and adjusts them if necessary."""
+    check_unfilled_orders()
     time.sleep(get_market_volatility())

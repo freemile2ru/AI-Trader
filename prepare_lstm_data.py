@@ -1,40 +1,72 @@
 import pandas as pd
-import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-import tensorflow as tf
+import requests
+import ta
 
-# Load Data
-file_path = "btc_usdt_technical.csv"  # Ensure the correct file path
-df = pd.read_csv(file_path)
+# Binance Futures API Base URL
+BINANCE_FUTURES_URL = "https://fapi.binance.com"
 
-# Select Features (Price + Indicators)
-features = ['close', 'volume', 'rsi', 'macd', 'bollinger_h', 'bollinger_l', 'sma_50', 'sma_200']
-df = df[features]
+def fetch_binance_ohlcv(symbol="BTCUSDT", interval="4h", total_candles=20000):
+    limit_per_request = 1000  # Binance max per request
+    all_data = []
+    end_time = None
 
-# Normalize Data
-scaler = MinMaxScaler(feature_range=(0, 1))
-scaled_data = scaler.fit_transform(df)
+    while len(all_data) < total_candles:
+        url = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit_per_request}
+        if end_time:
+            params["endTime"] = end_time  
 
-# Create Sequences for LSTM
-def create_sequences(data, seq_length=50):
-    X, y = [], []
-    for i in range(len(data) - seq_length - 1):
-        X.append(data[i : i + seq_length])  # Past 50 timestamps as features
-        y.append(data[i + seq_length, 0])   # Next closing price as label
-    return np.array(X), np.array(y)
+        response = requests.get(url, params=params).json()
+        if not response or "code" in response:
+            print(f"❌ API Error: {response}")
+            break  
 
-SEQ_LENGTH = 50  # Use the past 50 hours for prediction
-X, y = create_sequences(scaled_data, SEQ_LENGTH)
+        df = pd.DataFrame(response, columns=[
+            "timestamp", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "trades",
+            "taker_base_volume", "taker_quote_volume", "ignore"
+        ])
 
-# Split into Train & Test Sets
-split = int(0.8 * len(X))  # 80% Training, 20% Testing
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
 
-# Save Data for Training
-np.save("X_train.npy", X_train)
-np.save("X_test.npy", X_test)
-np.save("y_train.npy", y_train)
-np.save("y_test.npy", y_test)
+        # ✅ Fix: Extend instead of append
+        all_data.extend(df[["timestamp", "open", "high", "low", "close", "volume"]].values.tolist())
 
-print("✅ LSTM Training Data Prepared & Saved!")
+        print(f"📊 Fetched {len(df)} candles, Total: {len(all_data)}/{total_candles}")
+        print("=========All data size", len(all_data), interval)
+
+        # ✅ Update end_time correctly for next request
+        end_time = int(df["timestamp"].iloc[0].timestamp() * 1000)
+
+    # Convert final list back to DataFrame
+    full_df = pd.DataFrame(all_data, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    full_df.sort_values("timestamp", inplace=True)
+
+    return full_df[:total_candles]
+
+def compute_technical_indicators(df):
+    df["ATR"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+    df["RSI"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
+    df["EMA_10"] = ta.trend.EMAIndicator(df["close"], window=10).ema_indicator()
+    df["MACD"] = ta.trend.MACD(df["close"]).macd()
+
+    bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
+    df["bollinger_h"] = bb.bollinger_hband()
+    df["bollinger_l"] = bb.bollinger_lband()
+
+    df["SMA_50"] = ta.trend.SMAIndicator(df["close"], window=50).sma_indicator()
+    df["SMA_200"] = ta.trend.SMAIndicator(df["close"], window=200).sma_indicator()
+
+    return df 
+
+# ✅ Fetch OHLCV data for multiple timeframes
+df_4h = fetch_binance_ohlcv("BTCUSDT", interval="1h")
+
+df_4h = compute_technical_indicators(df_4h)
+
+
+# ✅ Save to CSV
+csv_filename = "btc_usdt_4h_technical_large.csv"
+df_4h.to_csv(csv_filename, index=False)
+print(f"✅ Dataset saved as {csv_filename}")

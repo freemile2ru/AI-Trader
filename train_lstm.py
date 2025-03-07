@@ -8,7 +8,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 
 # Load the dataset
-df = pd.read_csv("btc_usdt_technical.csv")  # Ensure the dataset includes FA + TA
+df = pd.read_csv("btc_usdt_5m_technical_large.csv")  # Ensure the dataset includes FA + TA
 
 # Feature Engineering: Create new indicators
 df["ATR"] = df["high"] - df["low"]  # Simplified ATR
