@@ -20,6 +20,7 @@ import pandas as pd
 from websocket import WebSocketApp
 import tweepy
 import ta
+from tensorflow.keras.losses import MeanSquaredError
 
 
 
@@ -45,8 +46,15 @@ client = tweepy.Client(bearer_token=TWITTER_BEARER_TOKEN)
 # Binance Futures API Base URL
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
 
+custom_objects = {"mse": MeanSquaredError()}
+
 # Load Trained LSTM Model
-model = tf.keras.models.load_model("lstm_model_fixed.h5")
+model5m = tf.keras.models.load_model("optimized_5m_lstm_model.h5", custom_objects=custom_objects)
+model1h = tf.keras.models.load_model("optimized_1h_lstm_model.h5", custom_objects=custom_objects)
+model4h = tf.keras.models.load_model("optimized_4h_lstm_model.h5", custom_objects=custom_objects)
+
+
+
 
 # Initialize Binance Futures Client
 binance = ccxt.binance({
@@ -55,9 +63,23 @@ binance = ccxt.binance({
     "options": {"defaultType": "future", "adjustForTimeDifference": True},
     "rateLimit": 1200,
 })
+
 binance.load_markets()
 
 open_trades = {}
+
+def final_prediction(symbol):
+    input_data_5m = get_real_time_data(symbol, '5m')
+    input_data_1h = get_real_time_data(symbol, '1h')
+    input_data_4h = get_real_time_data(symbol, '4h')
+    
+    pred_5m = model5m.predict(input_data_5m)[0][0]
+    pred_1h = model1h.predict(input_data_1h)[0][0]
+    pred_4h = model4h.predict(input_data_4h)[0][0]
+    
+    print("====predictions in ASC", pred_5m, pred_1h, pred_4h)
+    
+    return (0.25 * pred_5m) + (0.35 * pred_1h) + (0.4 * pred_4h)
 
 def get_whale_exchange_flows(symbol="BTCUSDT"):
     try:
@@ -438,24 +460,62 @@ def get_market_indicators():
         return None
 
 # Function to fetch real-time Binance Futures market data
-def get_real_time_data(symbol="BTC/USDT"):
+def get_real_time_data(symbol="BTC/USDT", interval="1h", X=50):
     binance_symbol = symbol.replace("/", "")
     endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
-    params = {"symbol": binance_symbol, "interval": "1h", "limit": 50}
-    
+    params = {"symbol": binance_symbol, "interval": interval, "limit": 250}  # Fetch more rows
+
     response = requests.get(endpoint, params=params)
     data = response.json()
     
-    ohlcv = np.array([[float(entry[i]) for i in range(1, 6)] for entry in data])
-    close_open_diff = (ohlcv[:, 3] - ohlcv[:, 0]).reshape(-1, 1)
-    high_low_diff = (ohlcv[:, 1] - ohlcv[:, 2]).reshape(-1, 1)
-    volume_change = np.append([0], np.diff(ohlcv[:, 4])).reshape(-1, 1)
+    if not isinstance(data, list) or len(data) < X:
+        raise ValueError(f"🚨 Error: Binance API returned only {len(data)} rows, but {X} are required!")
+
+    # Extract OHLCV data
+    df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', '_1', '_2', '_3', '_4', '_5', '_6'])
+    df = df[['close', 'volume']].astype(float)
+
+    # ✅ Compute Technical Indicators
+    df['ATR'] = ta.volatility.AverageTrueRange(high=df['close'], low=df['close'], close=df['close'], window=14).average_true_range()
+    df['RSI'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+    df['EMA_10'] = ta.trend.EMAIndicator(df['close'], window=10).ema_indicator()
+
+    macd = ta.trend.MACD(df['close'])
+    df['MACD'] = macd.macd()
+
+    bollinger = ta.volatility.BollingerBands(df['close'], window=20)
+    df['bollinger_h'] = bollinger.bollinger_hband()
+    df['bollinger_l'] = bollinger.bollinger_lband()
+
+    df['SMA_50'] = ta.trend.SMAIndicator(df['close'], window=50).sma_indicator()
+    df['SMA_200'] = ta.trend.SMAIndicator(df['close'], window=200).sma_indicator()
+
+    # ✅ Drop rows with NaNs caused by initial indicator calculations
+    df.dropna(inplace=True)
+
+    # ✅ Ensure at least `X` rows available after dropping NaNs
+    if len(df) < X:
+        raise ValueError(f"🚨 Error: After dropping NaNs, only {len(df)} rows remain, but {X} are required!")
+
+    # ✅ Normalize Data
+    min_vals, max_vals = df.min(), df.max()
     
-    full_features = np.hstack([ohlcv, close_open_diff, high_low_diff, volume_change])
-    min_vals, max_vals = full_features.min(axis=0), full_features.max(axis=0)
-    normalized_features = (full_features - min_vals) / (max_vals - min_vals)
-    
-    return np.expand_dims(normalized_features, axis=0)
+    # Handle cases where min = max (causes division by zero in normalization)
+    for col in df.columns:
+        if min_vals[col] == max_vals[col]:
+            df[col] = 0  # If all values are the same, set to zero
+        else:
+            df[col] = (df[col] - min_vals[col]) / (max_vals[col] - min_vals[col])
+
+    # ✅ Final check for NaNs
+    if df.isnull().values.any():
+        raise ValueError("🚨 Error: Normalized Data Still Contains NaNs!")
+
+    # ✅ Ensure shape is (1, X, 10)
+    final_input = np.expand_dims(df.values[-X:], axis=0)
+    print(f"✅ Final Input Shape: {final_input.shape}")  # Debugging
+    return final_input
+
 
 def cancel_order(symbol, order_id):
     """Cancels an open limit order and removes it from tracking."""
@@ -483,8 +543,7 @@ def cancel_order(symbol, order_id):
 
 # Function to predict price movement using LSTM model
 def predict_price_movement(symbol="BTC/USDT"):
-    input_data = get_real_time_data(symbol)
-    prediction = model.predict(input_data)[0][0]  # Get single prediction
+    prediction = final_prediction(symbol)
     
     # Get real-time price range from Binance
     min_price, max_price = get_price_min_max(symbol)
@@ -500,51 +559,37 @@ def predict_price_movement(symbol="BTC/USDT"):
     return predicted_price, futures_price
 
 
-def get_dynamic_sl_tp(symbol="BTC/USDT", current_price=0, side="BUY"):
+def get_dynamic_sl_tp(symbol="BTCUSDT", current_price=0, side="BUY"):
     try:
-        binance_symbol = symbol.replace("/", "")
-        endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
-        params = {"symbol": binance_symbol, "interval": "1h", "limit": 15}  # Fetch 15 candles to ensure enough data
+        # ✅ Get ATR (Average True Range)
+        atr = get_atr(symbol)
 
-        response = requests.get(endpoint, params=params).json()
-
-        if not response or len(response) < 15:
-            print("❌ Error: Binance API did not return enough data for ATR calculation.")
-            return None, None  # Prevents SL/TP from being invalid
-
-        highs = np.array([float(entry[2]) for entry in response[-14:]])  # Take last 14 highs
-        lows = np.array([float(entry[3]) for entry in response[-14:]])   # Take last 14 lows
-        closes = np.array([float(entry[4]) for entry in response[-15:]]) # Take last 15 closes to ensure match
-
-        if len(highs) != 14 or len(lows) != 14 or len(closes) != 15:
-            print(f"❌ ATR Calculation Error: Data length mismatch (Highs: {len(highs)}, Lows: {len(lows)}, Closes: {len(closes)})")
-            return None, None  # Prevents using invalid SL/TP
-
-        # ✅ Fix: Ensure shape alignment before ATR calculation
-        tr = np.maximum(highs - lows, np.maximum(abs(highs - closes[:-1]), abs(lows - closes[:-1])))
-
-        atr = np.mean(tr)
-
-        # Get support/resistance levels
+        # ✅ Get Support & Resistance Levels
         support, resistance = get_support_resistance(symbol)
 
-        if support is None or resistance is None:
-            print("❌ Error: Support/Resistance levels not found.")
-            return None, None  # Prevents using invalid SL/TP
+        # ✅ Get Market Volatility
+        volatility = get_market_volatility(symbol)
 
-        # Adjust SL & TP based on ATR & S/R levels
-        if side == "BUY":
-            stop_loss = max(current_price - 1.5 * atr, support * 0.99)
-            take_profit = min(current_price + 3 * atr, resistance * 1.01)
+        # ✅ Adjust SL/TP Multipliers Based on Volatility
+        if volatility > 5:
+            sl_multiplier, tp_multiplier = 1.5, 3.0  # High Volatility → Wider SL/TP
         else:
-            stop_loss = min(current_price + 1.5 * atr, resistance * 1.01)
-            take_profit = max(current_price - 3 * atr, support * 0.99)
+            sl_multiplier, tp_multiplier = 1.2, 2.5  # Normal Volatility → Tighter SL/TP
+
+        # ✅ Calculate SL & TP
+        if side == "BUY":
+            stop_loss = max(current_price - (sl_multiplier * atr), support * 0.99)
+            take_profit = min(current_price + (tp_multiplier * atr), resistance * 1.01)
+        else:  # SHORT position
+            stop_loss = min(current_price + (sl_multiplier * atr), resistance * 1.01)
+            take_profit = max(current_price - (tp_multiplier * atr), support * 0.99)
 
         return round(stop_loss, 2), round(take_profit, 2)
 
     except Exception as e:
-        print(f"❌ Error Fetching ATR-based SL/TP: {e}")
+        print(f"❌ Error Fetching Dynamic SL/TP: {e}")
         return None, None
+
 
 
 def log_trade(symbol, side, position_size, entry_price, stop_loss, take_profit, exit_price, result, pnl, trade_type="regular"):
@@ -569,6 +614,32 @@ def log_trade(symbol, side, position_size, entry_price, stop_loss, take_profit, 
         ])
 
     print(f"📊 Trade Closed & Logged: {trade_type.upper()} {side} {symbol} | PnL: {pnl}")
+
+def get_macd_crossover(symbol="BTCUSDT"):
+    """Detects MACD crossovers using Binance OHLCV data"""
+    try:
+        endpoint = "https://fapi.binance.com/fapi/v1/klines"
+        params = {"symbol": symbol, "interval": "1h", "limit": 50}  # Fetch 50 recent candles
+        response = requests.get(endpoint, params=params).json()
+
+        closes = np.array([float(entry[4]) for entry in response])
+
+        # MACD Calculation
+        short_ema = pd.Series(closes).ewm(span=12, adjust=False).mean()
+        long_ema = pd.Series(closes).ewm(span=26, adjust=False).mean()
+        macd_line = short_ema - long_ema
+        signal_line = macd_line.ewm(span=9, adjust=False).mean()
+
+        # Detect crossover
+        if macd_line.iloc[-2] < signal_line.iloc[-2] and macd_line.iloc[-1] > signal_line.iloc[-1]:
+            return "BULLISH"  # Bullish crossover
+        elif macd_line.iloc[-2] > signal_line.iloc[-2] and macd_line.iloc[-1] < signal_line.iloc[-1]:
+            return "BEARISH"  # Bearish crossover
+        return "NEUTRAL"
+
+    except Exception as e:
+        print(f"❌ Error Fetching MACD Crossover: {e}")
+        return "NEUTRAL"
 
 # Function to determine dynamic trade size based on risk factors
 def get_trade_size(symbol="BTC/USDT", risk_per_trade=0.02):
@@ -626,25 +697,27 @@ def get_open_trades(symbol="BTC/USDT"):
         print(f"❌ Error Fetching Open Trades: {e}")
         return []
  
-def should_dca(symbol="BTC/USDT"):
+def should_dca(symbol="BTCUSDT"):
+    open_trades = get_open_trades(symbol)
     if not open_trades:
-        return False, 0  # No existing trade → No DCA needed
+        return False, 0
 
     for pos in open_trades:
-        position_amt = float(pos["positionAmt"])
-        unrealized_pnl = float(pos["unrealizedProfit"])
-
-        # ✅ DCA only if unrealized losses exceed 2% of balance AND AI confirms a trend reversal
-        account_info = binance.fetch_balance({"type": "future"})
-        balance = float(account_info["totalWalletBalance"])
-
-        # AI checks for trend reversal confirmation
+        pnl = float(pos["unrealizedProfit"])
+        balance = float(binance.fetch_balance()["totalWalletBalance"])
+        
         predicted_price, current_price = predict_price_movement(symbol)
-        trend_reversal = (predicted_price > current_price and pos["positionSide"] == "SHORT") or (predicted_price < current_price and pos["positionSide"] == "LONG")
+        rsi = get_rsi(symbol)
+        macd_crossover = get_macd_crossover(symbol)
 
-        if unrealized_pnl < -0.02 * balance and trend_reversal:  
-            new_position_size = abs(position_amt) * 0.5  # Add 50% of current position
-            return True, round(new_position_size, 6)  
+        if pnl < -0.02 * balance and predicted_price > current_price and rsi < 30 and macd_crossover == "BULLISH":
+            atr = get_atr()
+            atr_dca_multiplier = 0.3 if atr < 20 else 0.5
+            dca_size = abs(float(pos["positionAmt"])) * atr_dca_multiplier
+            return True, round(dca_size, 6)
+
+    return False, 0
+
 
     return False, 0  # Default to no DCA
 
@@ -737,29 +810,16 @@ def get_trend_strength(symbol="BTC/USDT"):
         print(f"❌ Error Fetching Trend Strength: {e}")
         return 0  # Default to neutral trend if API fails
    
-def get_trade_confidence(symbol="BTC/USDT"):
-    support, resistance = get_support_resistance(symbol)
-    atr = get_atr(symbol)
-    trend_strength = get_trend_strength(symbol)
-    historical_win_rate = get_historical_win_rate(symbol)
-    fundamental_score = get_fundamental_score()  # ✅ Now includes FA
-
-    confidence = 50  # Base confidence at 50%
-
-    # ✅ Technical Analysis (TA) Weights (60%)
-    confidence += min(max(trend_strength * 30, 0), 30)
-    confidence += min(max((atr / get_real_time_price(symbol)) * 10, 0), 10)
-    confidence += min(max((1 - (abs(get_real_time_price(symbol) - support) / (resistance - support))) * 20, 0), 20)
-
-    # ✅ Fundamental Analysis (FA) Weight (30%)
-    confidence += min(max(fundamental_score * 0.3, -15), 15)
-
-    # ✅ Historical Trade Performance (10%)
-    confidence += min(max(historical_win_rate * 10, 0), 10)
-
-    return max(0, min(100, confidence))
-
-
+def get_trade_confidence(symbol="BTCUSDT"):
+    weights = {"trend_strength": 0.4, "atr": 0.2, "fundamental": 0.3, "historical_win_rate": 0.1}
+    
+    trend_strength = get_trend_strength(symbol) * weights["trend_strength"]
+    atr = (get_atr(symbol) / get_real_time_price(symbol)) * weights["atr"]
+    fundamental_score = get_fundamental_score() * weights["fundamental"]
+    historical_win_rate = get_historical_win_rate(symbol) * weights["historical_win_rate"]
+    
+    confidence = (trend_strength + atr + fundamental_score + historical_win_rate) * 100
+    return round(min(100, max(0, confidence)), 2)
 
 # Function to place an AI-driven trade with corrected trade direction
 def place_ai_trade(symbol="BTC/USDT"):
