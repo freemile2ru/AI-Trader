@@ -1,54 +1,39 @@
 import numpy as np
-import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-from tensorflow.keras.optimizers import Adam
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import matplotlib.pyplot as plt
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# Load the dataset
-df = pd.read_csv("btc_usdt_5m_technical_large.csv")  # Ensure the dataset includes FA + TA
+# Load Processed Data
+X_train = np.load("X_train.npy")
+X_test = np.load("X_test.npy")
+y_train = np.load("y_train.npy")
+y_test = np.load("y_test.npy")
 
-# Feature Engineering: Create new indicators
-df["ATR"] = df["high"] - df["low"]  # Simplified ATR
-df["RSI"] = 100 - (100 / (1 + (df["close"].pct_change() + 1).rolling(14).mean()))
-df["EMA_10"] = df["close"].ewm(span=10).mean()
-df["MACD"] = df["EMA_10"] - df["close"].ewm(span=26).mean()
-
-# Select features & target
-features = ["close", "volume", "ATR", "RSI", "EMA_10", "MACD"]
-target = "close"  # Predict future price
-
-scaler = MinMaxScaler()
-df[features] = scaler.fit_transform(df[features])
-
-# Prepare training data
-X, y = [], []
-lookback = 50  # Number of past timesteps to use
-
-for i in range(lookback, len(df) - 1):
-    X.append(df[features].iloc[i - lookback:i].values)
-    y.append(df[target].iloc[i + 1])  # Predict next step
-
-X, y = np.array(X), np.array(y)
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-
-# ✅ Improved LSTM Model
+# Build LSTM Model
 model = Sequential([
-    LSTM(128, return_sequences=True, input_shape=(lookback, len(features))),
+    LSTM(units=64, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])),
     Dropout(0.2),
-    BatchNormalization(),
-    
-    LSTM(64, return_sequences=False),
+    LSTM(units=32, return_sequences=False),
     Dropout(0.2),
-    
-    Dense(32, activation="relu"),
-    Dense(1)  # Output layer
+    Dense(units=1)
 ])
 
-model.compile(optimizer=Adam(learning_rate=0.001), loss="mse", metrics=["mae"])
-model.fit(X_train, y_train, epochs=50, batch_size=32, validation_data=(X_test, y_test), verbose=1)
+# Compile Model
+model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 
-# Save the trained model
-model.save("optimized_lstm_model.h5")
+# Train Model
+history = model.fit(X_train, y_train, epochs=100, batch_size=64, validation_data=(X_test, y_test))
+
+# Save Model
+model.save("optimized_4h_lstm_model.h5")
+
+# Evaluate Model
+y_pred = model.predict(X_test)
+
+# Calculate Errors
+mae = mean_absolute_error(y_test, y_pred)
+mse = mean_squared_error(y_test, y_pred)
+
+print(f"✅ Model Training Complete | MAE: {mae:.4f} | MSE: {mse:.4f}")
