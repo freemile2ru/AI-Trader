@@ -86,13 +86,23 @@ for index, row in df.iterrows():
     stop_loss = max(current_price * 0.995, current_price - atr_multiplier * atr) if side == "BUY" else min(current_price * 1.005, current_price + atr_multiplier * atr)
     take_profit = min(current_price * 1.01, current_price + (atr_multiplier * 2.5 * atr)) if side == "BUY" else max(current_price * 0.99, current_price - (atr_multiplier * 2.5 * atr))
 
+    # ✅ **Calculate Risk-to-Reward Ratio (RRR)**
+    risk = abs(current_price - stop_loss)
+    reward = abs(take_profit - current_price)
+    rrr = reward / risk if risk > 0 else 0
+
+    print(f"📊 Paper Trade RRR Calculation: Risk = {risk:.2f}, Reward = {reward:.2f}, RRR = {rrr:.2f}")
+
+    if rrr < 2.0:
+        print(f"❌ Paper Trade Rejected: RRR {rrr:.2f} is too low (needs at least 2:1).")
+        continue
+
     if balance < 100:
         print(f"🚨 Insufficient Funds! Stopping at trade {index}. Final Balance: ${balance:.2f}")
         break
 
     position_size = get_dynamic_position_size(balance)
-
-    exit_price = row["close"] * (1.02 if side == "BUY" else 0.98)
+    exit_price = row["close"]
     profit = (exit_price - current_price) * position_size if side == "BUY" else (current_price - exit_price) * position_size
 
     balance += profit
@@ -110,38 +120,18 @@ max_drawdown = max([max(balances[:i+1]) - balance for i, balance in enumerate(ba
 
 print(f"✅ Backtest Complete. Win Rate: {win_rate:.2f}% | Avg Profit/Trade: ${average_profit:.2f} | Max Drawdown: ${max_drawdown:.2f}")
 
-
-print(f"✅ Backtest Complete. Win Rate: {win_rate:.2f}% | Avg Profit/Trade: ${average_profit:.2f} | Max Drawdown: ${max_drawdown:.2f}")
-
-# Print Summary
-print(f"✅ Backtest Complete. Results Saved!")
-print(f"📊 Win Rate: {win_rate:.2f}%")
-print(f"💰 Average Profit per Trade: ${average_profit:.2f}")
-print(f"📉 Max Drawdown: ${max_drawdown:.2f}")
-
 # Save Results
 pd.DataFrame(trade_log).to_csv("backtest_results.csv", index=False)
 print("✅ Backtesting Completed. Results saved to backtest_results.csv")
-if balance <= 0:
-    print("❌ The bot lost all funds! Consider adjusting risk management.")
 
+# ✅ **Plot Performance**
 results_df = pd.DataFrame(trade_log)
 results_df["Cumulative Balance"] = initial_balance + results_df["pnl"].cumsum()
 
 plt.figure(figsize=(12, 6))
-plt.subplot(2, 1, 1)
 plt.plot(results_df["Cumulative Balance"], label="Balance Over Time", marker="o")
 plt.xlabel("Trades")
 plt.ylabel("Balance ($)")
 plt.title("Backtest Performance")
 plt.legend()
-
-plt.subplot(2, 1, 2)
-plt.bar(range(len(results_df)), results_df["pnl"], color=['green' if p > 0 else 'red' for p in results_df["pnl"]])
-plt.xlabel("Trades")
-plt.ylabel("Profit/Loss")
-plt.title("Trade Profitability")
-
-plt.tight_layout()
 plt.show()
-
