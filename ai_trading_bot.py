@@ -18,9 +18,10 @@ import threading
 import json
 import pandas as pd
 from websocket import WebSocketApp
-import tweepy
 import ta
+import logging
 from tensorflow.keras.losses import MeanSquaredError
+import subprocess
 
 
 
@@ -36,12 +37,7 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET_KEY")
 CRYPTO_PANIC_API_KEY = os.getenv("CRYPTO_PANIC_API_KEY")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
-
-# Twitter API credentials (Ensure you have a valid Twitter Developer API Key)
-TWITTER_BEARER_TOKEN = os.getenv("TWITTER_BEARER_TOKEN")
-
-# Initialize Twitter API Client
-client = tweepy.Client(bearer_token=TWITTER_BEARER_TOKEN)
+SOUND_FILE = '/System/Library/Sounds/Glass.aiff'
 
 # Binance Futures API Base URL
 BINANCE_FUTURES_URL = "https://fapi.binance.com"
@@ -67,6 +63,10 @@ binance = ccxt.binance({
 binance.load_markets()
 
 open_trades = {}
+
+
+INITIAL_BALANCE = float(binance.fetch_balance({"type": "future"})["info"]["totalWalletBalance"])
+consecutive_losses = 0  # Track losing streak
 
 def final_prediction(symbol):
     input_data_5m = get_real_time_data(symbol, '5m')
@@ -94,6 +94,9 @@ def get_whale_exchange_flows(symbol="BTCUSDT"):
         print(f"❌ Error Fetching Whale Exchange Flow: {e}")
         return 0, 0
 
+def play_sound():
+    subprocess.run(["afplay", SOUND_FILE])
+    
 
 def get_news_sentiment():
     try:
@@ -182,52 +185,220 @@ def generate_signature(params):
     query_string = urlencode(params)
     return hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
 
-def get_fundamental_score():
-    news_sentiment = get_combined_news_sentiment()
-    exchange_inflow, buy_volume = get_whale_exchange_flows()  # ✅ New Whale Tracking
-    funding_rate, open_interest = get_funding_rate()
+def fetch_btc_price_momentum(symbol="BTCUSDT"):
+    """
+    Fetches the last 7 days of BTC prices to calculate:
+    - Price Momentum (current price vs. 7-day average)
+    - ATR (Volatility) as a percentage of price
+    """
+    try:
+        # ✅ Fetch last 7 days of BTC price data
+        history_endpoint = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": "1d", "limit": 8}  # Fetch 8 days to compute 7-day ATR
+        response = requests.get(history_endpoint, params=params).json()
 
-    fundamental_score = 50  # Start at neutral 50%
+        # ✅ Extract closing prices & high-low ranges
+        closing_prices = np.array([float(day[4]) for day in response])  # Closing prices
+        high_prices = np.array([float(day[2]) for day in response])  # High prices
+        low_prices = np.array([float(day[3]) for day in response])  # Low prices
+
+        # ✅ Compute 7-day average closing price (momentum baseline)
+        avg_price = np.mean(closing_prices[:-1])  # Exclude last day (current price)
+        current_price = closing_prices[-1]
+
+        # ✅ Compute ATR (Normalized)
+        tr = np.maximum(high_prices[1:] - low_prices[1:],  # High - Low
+                        np.abs(high_prices[1:] - closing_prices[:-1]),  # High - Prev Close
+                        np.abs(low_prices[1:] - closing_prices[:-1]))  # Low - Prev Close
+        atr = np.mean(tr)  # Average True Range (ATR)
+
+        # ✅ Normalize ATR as a percentage of average price
+        atr_pct = (atr / avg_price) * 100  # ATR as percentage of price
+
+        # ✅ Compute Momentum (relative change vs. 7-day avg)
+        price_momentum = ((current_price - avg_price) / avg_price) * 100  # Percentage change
+
+        return price_momentum, atr_pct  # ATR is now a percentage
+
+    except Exception as e:
+        print(f"❌ Error Fetching BTC Price Momentum: {e}")
+        return 0, 0  # Default values if API fails
+
+logging.basicConfig(filename="fundamental_score_log.txt", level=logging.INFO, format="%(asctime)s - %(message)s")
+
+def get_fundamental_score():
+    """
+    Computes the fundamental score based on:
+    - News Sentiment
+    - Whale Activity (Exchange Inflow)
+    - Buy Volume (Whale Buying Activity)
+    - Funding Rates
+    - Price Momentum & Volatility (Replaces Open Interest)
+    """
+
+    # ✅ Fetch real-time market data
+    news_sentiment = get_combined_news_sentiment() or 0  # Default to neutral if None
+    exchange_inflow, buy_volume = get_whale_exchange_flows()
+    funding_rate = get_funding_rate()[0] or 0  # Only funding rate
+    whale_activity = get_whale_activity()
+
+    # ✅ Fetch 7-day historical averages
+    history = fetch_last_7_days_market_data()
+    avg_exchange_inflow = history.get("exchange_inflow", exchange_inflow)  # Use current if history missing
+    avg_buy_volume = history.get("buy_volume", buy_volume)
+    avg_funding_rate = history.get("funding_rate", funding_rate)
+
+    # ✅ Fetch BTC Price Momentum & Volatility
+    price_momentum, volatility = fetch_btc_price_momentum()
+
+    # ✅ Initialize score (Neutral 50%)
+    fundamental_score = 50  
+
+    # ✅ Log Raw Values Before Adjustments
+    logging.info(f"Initial Fundamental Score: {fundamental_score}")
+    logging.info(f"News Sentiment: {news_sentiment}")
+    logging.info(f"Exchange Inflow: {exchange_inflow}, Avg Exchange Inflow: {avg_exchange_inflow}")
+    logging.info(f"Buy Volume: {buy_volume}, Avg Buy Volume: {avg_buy_volume}")
+    logging.info(f"Funding Rate: {funding_rate}, Avg Funding Rate: {avg_funding_rate}")
+    logging.info(f"Price Momentum: {price_momentum}")
+    logging.info(f"Volatility (ATR %): {volatility}")
+    logging.info(f"Whale Activity: {whale_activity}")
 
     # ✅ News Sentiment Weight (40%)
-    fundamental_score += min(max(news_sentiment * 40, -20), 20)
+    sentiment_adjustment = min(max(news_sentiment * 40, -20), 20)
+    fundamental_score += sentiment_adjustment
+    logging.info(f"News Sentiment Adjustment: {sentiment_adjustment}, New Score: {fundamental_score}")
 
     # ✅ Whale Activity (Exchange Inflow) Weight (30%)
-    if exchange_inflow > 1_000_000_000:  # If total inflow > $1B in 24h
-        fundamental_score += 15  # Indicates strong market interest
-    elif exchange_inflow < 500_000_000:  # If total inflow < $500M
-        fundamental_score -= 10  # Market slowing down
+    if whale_activity == 'HIGH':
+        fundamental_score += 15
+        logging.info("Whale Activity HIGH: +15 Score")
+    elif exchange_inflow < 0.8 * avg_exchange_inflow:
+        fundamental_score -= 10
+        logging.info("Low Exchange Inflow: -10 Score")
 
     # ✅ Buy Volume Weight (Whale Buying Activity)
-    if buy_volume > 10_000:  # If more than 10K BTC bought in 24h
-        fundamental_score += 10  # Whales accumulating BTC
-    elif buy_volume < 5_000:  # If fewer than 5K BTC bought
-        fundamental_score -= 5  # Weak buy pressure
+    if buy_volume > 1.5 * avg_buy_volume:
+        fundamental_score += 10
+        logging.info("High Buy Volume: +10 Score")
+    elif buy_volume < 0.7 * avg_buy_volume:
+        fundamental_score -= 5
+        logging.info("Low Buy Volume: -5 Score")
 
     # ✅ Funding Rate Weight (20%)
-    if abs(funding_rate) > 0.03:  # Extreme funding rate
-        fundamental_score -= 15  # Market imbalance detected
+    if abs(funding_rate) > 1.5 * abs(avg_funding_rate):
+        fundamental_score -= 15
+        logging.info("Extreme Funding Rate: -15 Score")
 
-    # ✅ Open Interest Weight (10%)
-    if open_interest > 100_000:
-        fundamental_score += 10  # More open positions = strong market
+    # ✅ Price Momentum Weight (NEW - Replaces Open Interest)
+    if price_momentum > 2:
+        fundamental_score += 10
+        logging.info("Positive Price Momentum: +10 Score")
+    elif price_momentum < -2:
+        fundamental_score -= 10
+        logging.info("Negative Price Momentum: -10 Score")
 
-    return max(0, min(100, fundamental_score))  # Keep score between 0-100
+    # ✅ Volatility (ATR) Weight (NEW)
+    if volatility > max(0.03 * abs(price_momentum), 1.5):
+        fundamental_score -= 10
+        logging.info("High Volatility: -10 Score")
+
+    # ✅ Prevent Fundamental Score from Reaching 0 Too Often
+    fundamental_score = max(10, fundamental_score)  # Ensure minimum score of 10 to prevent 0
+
+    # ✅ Log Final Score
+    logging.info(f"Final Fundamental Score: {fundamental_score}\n")
+
+    return min(100, fundamental_score)  # Keep
 
 
 def get_funding_rate(symbol="BTCUSDT"):
     try:
-        response = requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/premiumIndex", params={"symbol": symbol}).json()
-        
-        funding_rate = round(float(response["lastFundingRate"]), 6)
-        open_interest = float(response.get("openInterest", 0))
+        # Fetch latest funding rate
+        response = requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": 1}).json()
 
-        print(f"📊 Funding Rate: {funding_rate:.4f} | Open Interest: {open_interest:.2f}")
-        return funding_rate, open_interest
+        if isinstance(response, list) and len(response) > 0:
+            # Extract funding rate and open interest while preserving precision
+            funding_rate = float(response[0].get("fundingRate", "0"))  # Avoid premature rounding
+            open_interest = float(response[0].get("openInterest", "0"))  # Ensure valid float
+            
+            # Display accurate funding rate (6 decimal places)
+            print(f"📊 Funding Rate: {funding_rate:.6f} | Open Interest: {open_interest:.2f}")
+            return funding_rate, open_interest
+
+        else:
+            return 0.0, 0.0  # Handle unexpected API response
 
     except Exception as e:
         print(f"❌ Error Fetching Funding Rate: {e}")
-        return 0, 0
+        return 0.0, 0.0
+
+def fetch_binance_data(endpoint, params=None, max_retries=3):
+    """
+    Fetch data from Binance API with retry logic.
+    - Retries up to `max_retries` times if the request fails.
+    - Uses exponential backoff for rate limits.
+    """
+    retries = 0
+    while retries < max_retries:
+        try:
+            response = requests.get(f"{BINANCE_FUTURES_URL}{endpoint}", params=params, timeout=5)
+            
+            # ✅ Ensure request is successful
+            if response.status_code == 200 and response.text.strip():
+                return response.json()
+
+            # ✅ Handle rate limit response
+            elif response.status_code == 429:
+                wait_time = (2 ** retries)  # Exponential backoff
+                print(f"🚨 Rate limit exceeded. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ API Request Error ({endpoint}): {e}")
+
+        retries += 1
+        time.sleep(2 ** retries)  # Exponential backoff delay
+
+    print(f"❌ Failed to fetch data from {endpoint} after {max_retries} retries.")
+    return None  # Ensure we return None if all retries fail
+
+def fetch_last_7_days_market_data(symbol="BTCUSDT"):
+    """
+    Fetches the last 7 days of BTC market data, ensuring accurate values:
+    - Buy Volume (BTC)
+    - Exchange Inflow (Quote Volume)
+    - Funding Rates
+    - Open Interest
+    """
+
+    try:
+        # ✅ Fetch last 7 days of BTC volume & exchange inflow
+        history_data = fetch_binance_data("/fapi/v1/klines", {"symbol": symbol, "interval": "1d", "limit": 7})
+        if history_data:
+            historical_volumes = [float(day[5]) for day in history_data]  # Buy Volume (BTC)
+            historical_exchange_inflow = [float(day[7]) for day in history_data]  # Quote Volume (USDT)
+        else:
+            raise ValueError("⚠️ Missing data from klines API")
+
+        # ✅ Fetch real-time funding rates from Binance
+        funding_data = fetch_binance_data("/fapi/v1/fundingRate", {"symbol": symbol, "limit": 7})
+        if funding_data:
+            historical_funding_rates = [float(entry.get("fundingRate", 0)) for entry in funding_data]
+        else:
+            raise ValueError("⚠️ Missing data from fundingRate API")
+
+
+        # ✅ Compute and return 7-day averages
+        return {
+            "buy_volume": np.mean(historical_volumes),
+            "funding_rate": np.mean(historical_funding_rates),
+            "exchange_inflow": np.mean(historical_exchange_inflow),
+        }
+
+    except Exception as e:
+        print(f"❌ Critical Error Fetching Market History: {e}")
+        raise RuntimeError("🚨 Market data retrieval failed.")  # Ensure program stops if data is missing
 
 def get_fibonacci_levels(symbol="BTCUSDT"):
     """Calculate Fibonacci retracement levels based on recent high and low."""
@@ -417,6 +588,7 @@ def check_unfilled_orders():
 def get_market_volatility(symbol="BTC/USDT"):
     binance_symbol = symbol.replace("/", "")
     endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/24hr"
+    price_change_pct = None
     
     try:
         response = requests.get(endpoint, params={"symbol": binance_symbol}).json()
@@ -424,15 +596,15 @@ def get_market_volatility(symbol="BTC/USDT"):
         
         # Adjust trading frequency based on volatility
         if price_change_pct > 5:  # High volatility
-            return 60  # Check every 1 minute
+            return 60, price_change_pct  # Check every 1 minute
         elif price_change_pct > 2:  # Medium volatility
-            return 300  # Check every 5 minutes
+            return 300, price_change_pct  # Check every 5 minutes
         else:  # Low volatility
-            return 900  # Check every 15 minutes
+            return 900, price_change_pct  # Check every 15 minutes
         
     except Exception as e:
         print(f"❌ Error Fetching Market Volatility: {e}")
-        return 900  # Default to 15 minutes if API fails
+        return 900 , price_change_pct # Default to 15 minutes if API fails
     
 # Function to get min/max price from Binance 24hr stats
 def get_price_min_max(symbol="BTC/USDT"):
@@ -559,37 +731,85 @@ def predict_price_movement(symbol="BTC/USDT"):
     return predicted_price, futures_price
 
 
-def get_dynamic_sl_tp(symbol="BTCUSDT", current_price=0, side="BUY"):
+def get_dynamic_sl_tp(symbol="BTC/USDT", entry_price=0, side="BUY", predicted_price=0):
+    """Calculate dynamic Stop-Loss (SL) & Take-Profit (TP) with ATR, Predicted Price, and Support/Resistance."""
     try:
-        # ✅ Get ATR (Average True Range)
-        atr = get_atr(symbol)
+        binance_symbol = symbol.replace("/", "")
+        endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
+        params = {"symbol": binance_symbol, "interval": "1h", "limit": 15}  # ✅ Fetch last 15 candles
 
-        # ✅ Get Support & Resistance Levels
+        response = requests.get(endpoint, params=params).json()
+        highs = np.array([float(entry[2]) for entry in response])
+        lows = np.array([float(entry[3]) for entry in response])
+        closes = np.array([float(entry[4]) for entry in response])
+
+        # ✅ Ensure arrays have the same length (trim to 14 elements)
+        highs, lows, closes = highs[-14:], lows[-14:], closes[-14:]
+
+        # ✅ Use np.roll() to get previous closes properly
+        prev_closes = np.roll(closes, shift=1)
+        prev_closes[0] = closes[0]  # Prevents NaN issues
+
+        # ✅ Calculate ATR
+        tr1 = highs - lows
+        tr2 = np.abs(highs - prev_closes)
+        tr3 = np.abs(lows - prev_closes)
+        tr = np.maximum(tr1, np.maximum(tr2, tr3))  # True Range
+        atr = np.mean(tr)  # Average True Range
+
+        # ✅ Get Support/Resistance Levels
         support, resistance = get_support_resistance(symbol)
 
-        # ✅ Get Market Volatility
-        volatility = get_market_volatility(symbol)
+        # ✅ Factor in Predicted Price to Improve SL & TP Calculation
+        if predicted_price == 0:
+            predicted_price = entry_price  # Default if prediction is missing
 
-        # ✅ Adjust SL/TP Multipliers Based on Volatility
-        if volatility > 5:
-            sl_multiplier, tp_multiplier = 1.5, 3.0  # High Volatility → Wider SL/TP
-        else:
-            sl_multiplier, tp_multiplier = 1.2, 2.5  # Normal Volatility → Tighter SL/TP
-
-        # ✅ Calculate SL & TP
+        # ✅ Define Multiplier Based on Volatility
+        volatility_factor = max(1.5, min(3.0, atr / (entry_price * 0.01)))  # Scale dynamically
+        
         if side == "BUY":
-            stop_loss = max(current_price - (sl_multiplier * atr), support * 0.99)
-            take_profit = min(current_price + (tp_multiplier * atr), resistance * 1.01)
-        else:  # SHORT position
-            stop_loss = min(current_price + (sl_multiplier * atr), resistance * 1.01)
-            take_profit = max(current_price - (tp_multiplier * atr), support * 0.99)
+            stop_loss = max(entry_price - (1.5 * atr * volatility_factor), support * 0.99)
+            take_profit = min(entry_price + (3 * atr * volatility_factor), resistance * 1.01)
+
+            # ✅ Ensure SL < Entry < TP
+            if stop_loss >= entry_price:
+                stop_loss = entry_price - (1.5 * atr * volatility_factor)
+            if take_profit <= entry_price:
+                take_profit = entry_price + (3 * atr * volatility_factor)
+
+            # ✅ Adjust TP if the Predicted Price is Higher than Entry
+            if predicted_price > entry_price:
+                take_profit = max(take_profit, predicted_price * 1.02)  # Ensure TP is at least 2% above predicted price
+
+        else:  # `SELL`
+            stop_loss = min(entry_price + (1.5 * atr * volatility_factor), resistance * 1.01)
+            take_profit = max(entry_price - (3 * atr * volatility_factor), support * 0.99)
+
+            # ✅ Ensure TP < Entry < SL
+            if stop_loss <= entry_price:
+                stop_loss = entry_price + (1.5 * atr * volatility_factor)
+            if take_profit >= entry_price:
+                take_profit = entry_price - (3 * atr * volatility_factor)
+
+            # ✅ Adjust TP if the Predicted Price is Lower than Entry
+            if predicted_price < entry_price:
+                take_profit = min(take_profit, predicted_price * 0.98)  # Ensure TP is at least 2% below predicted price
+
+        # ✅ Enforce Minimum 2:1 Risk-Reward Ratio
+        risk = abs(entry_price - stop_loss)
+        reward = abs(take_profit - entry_price)
+        rrr = reward / risk if risk > 0 else 0
+
+        if rrr < 2.0:  # If RRR < 2:1, widen TP
+            take_profit = entry_price + (risk * 2.5) if side == "BUY" else entry_price - (risk * 2.5)
+
+        print(f"📊 SL/TP Calculation: SL = {stop_loss:.2f}, Entry = {entry_price:.2f}, TP = {take_profit:.2f}, ATR = {atr:.2f}, RRR = {rrr:.2f}")
 
         return round(stop_loss, 2), round(take_profit, 2)
 
     except Exception as e:
-        print(f"❌ Error Fetching Dynamic SL/TP: {e}")
+        print(f"❌ Error Fetching ATR-based SL/TP: {e}")
         return None, None
-
 
 
 def log_trade(symbol, side, position_size, entry_price, stop_loss, take_profit, exit_price, result, pnl, trade_type="regular"):
@@ -612,6 +832,11 @@ def log_trade(symbol, side, position_size, entry_price, stop_loss, take_profit, 
             datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             symbol, side, position_size, entry_price, exit_price, stop_loss, take_profit, result, round(pnl, 4), trade_type
         ])
+    
+    if result == "LOSS":
+        consecutive_losses += 1
+    else:
+        consecutive_losses = 0  # Reset on win
 
     print(f"📊 Trade Closed & Logged: {trade_type.upper()} {side} {symbol} | PnL: {pnl}")
 
@@ -642,11 +867,10 @@ def get_macd_crossover(symbol="BTCUSDT"):
         return "NEUTRAL"
 
 # Function to determine dynamic trade size based on risk factors
-def get_trade_size(symbol="BTC/USDT", risk_per_trade=0.02):
+def get_trade_size(symbol="BTCUSDT", risk_per_trade=0.02):
     try:
         # Fetch Binance Futures account balance
         account_info = binance.fetch_balance({"type": "future"})
-        print(account_info["info"]["totalWalletBalance"])
         balance = float(account_info["info"]["totalWalletBalance"])  # Available balance in Futures
 
         # Fetch active positions
@@ -658,26 +882,35 @@ def get_trade_size(symbol="BTC/USDT", risk_per_trade=0.02):
         unrealized_pnl = sum(float(pos["unrealizedProfit"]) for pos in active_positions)
 
         # Get market volatility
-        volatility = abs(float(requests.get(f"{BINANCE_FUTURES_URL}/fapi/v1/ticker/24hr", params={"symbol": symbol.replace("/", "")}).json()["priceChangePercent"])) / 100
-
-        # Base position size (Risk % of balance)
-        position_size = (risk_per_trade * balance) / volatility if volatility > 0 else (risk_per_trade * balance)
-
-        # Adjust for active trades to prevent overexposure
-        if num_active_trades > 3:
-            position_size *= 0.7  # Reduce size if too many trades are open
+        _, price_change_pct = get_market_volatility()
         
-        # Adjust for unrealized PnL (Reduce size if floating losses are high)
-        if unrealized_pnl < -0.03 * balance:  # If unrealized losses exceed 3% of balance
-            position_size *= 0.5  # Reduce trade size by 50%
+        volatility = abs(float(price_change_pct)) / 100
+        
+        balance = float(account_info["info"]["totalWalletBalance"])
 
-        # Ensure minimum allowable trade size
-        min_size = max(0.005, round((100 / get_price_min_max(symbol)[1]), 6))
-        position_size = max(min_size, position_size)
+        current_price = get_real_time_price(symbol)
 
-        print(f"📊 Trade Size: {position_size:.6f} BTC | Active Trades: {num_active_trades} | Unrealized PnL: {unrealized_pnl:.2f}")
-        return position_size
-    
+        # ✅ Base position size in USDT based on risk percentage
+        position_size_usdt = (risk_per_trade * balance) / volatility if volatility > 0 else (risk_per_trade * balance)
+
+        # ✅ Convert USDT position size to BTC
+        position_size_btc = position_size_usdt / current_price
+
+        # ✅ Adjust for Unrealized PnL
+        if unrealized_pnl < -0.03 * balance:  # Large unrealized losses
+            position_size_btc *= 0.5  # Reduce position size
+
+        # ✅ Adjust for multiple active trades
+        if num_active_trades > 3:
+            position_size_btc *= 0.7  # Reduce size if too many trades are open
+
+        # ✅ Ensure minimum trade size (Binance minimum is 0.005 BTC)
+        min_size = 0.005
+        position_size_btc = max(min_size, position_size_btc)
+
+        print(f"📊 Paper Trade Size: {position_size_btc:.6f} BTC | Active Trades: {num_active_trades} | Unrealized PnL: {unrealized_pnl:.2f}")
+        return position_size_btc
+        
     except Exception as e:
         print(f"❌ Error Fetching Trade Size: {e}")
         return 0.005  # Default to minimum if API fails
@@ -718,8 +951,23 @@ def should_dca(symbol="BTCUSDT"):
 
     return False, 0
 
-
-    return False, 0  # Default to no DCA
+def is_valid_trade(symbol, side):
+    sma_50, sma_200 = get_sma_levels(symbol)
+    rsi = get_rsi(symbol)
+    sentiment_score = get_combined_news_sentiment()
+    
+    if side == "BUY" and sma_50 < sma_200:
+        return False  # Avoid buying in a downtrend
+    if side == "SELL" and sma_50 > sma_200:
+        return False  # Avoid shorting in an uptrend
+    if rsi > 70 and side == "BUY":
+        return False  # Overbought condition
+    if rsi < 30 and side == "SELL":
+        return False  # Oversold condition
+    if sentiment_score < 0:
+        return False  # Bearish sentiment
+    
+    return True
 
 def is_profitable_setup(symbol="BTC/USDT", side="BUY"):
     try:
@@ -737,22 +985,28 @@ def is_profitable_setup(symbol="BTC/USDT", side="BUY"):
         print(f"❌ Error Checking Trade Setup Profitability: {e}")
         return True  # Default to allowing the trade if error
 
-def get_historical_win_rate(symbol="BTC/USDT"):
+def get_historical_win_rate(symbol="BTCUSDT"):
+    """
+    Computes the historical win rate for a symbol based on past trade logs.
+    If insufficient trades exist, decays the confidence contribution.
+    """
     try:
         df = pd.read_csv("trade_logs.csv")  # Load past trade logs
-        df = df[(df["symbol"] == symbol)]
+        df = df[df["symbol"] == symbol]
 
         if len(df) < 10:
-            return 0.5  # Default to 50% win rate if not enough data
+            # Penalize win rate contribution if trade count is too low
+            return 0.25  # Default to 25% if not enough data
 
+        # Compute win rate based on last 50 trades (if available)
+        df = df.tail(50)
         win_rate = df["result"].value_counts(normalize=True).get("WIN", 0)
 
-        return round(win_rate, 2)  # Return win rate as a decimal (e.g., 0.65 for 65%)
+        return round(min(max(win_rate, 0.25), 0.75), 2)  # Cap win rate between 25% and 75%
 
     except Exception as e:
         print(f"❌ Error Fetching Historical Win Rate: {e}")
-        return 0.5  # Default to 50% if an error occurs
-
+        return 0.25  # Default to low confidence if error occurs
 
 def get_atr(symbol="BTC/USDT", period=14):
     try:
@@ -784,11 +1038,11 @@ def get_atr(symbol="BTC/USDT", period=14):
     except Exception as e:
         print(f"❌ Error Fetching ATR: {e}")
         return 0  # ✅ Return 0 instead of None to prevent SL/TP issues
-
-
-
  
-def get_trend_strength(symbol="BTC/USDT"):
+def get_trend_strength(symbol="BTCUSDT"):
+    """
+    Computes trend strength based on 10-period vs. 50-period moving average.
+    """
     try:
         binance_symbol = symbol.replace("/", "")
         endpoint = f"{BINANCE_FUTURES_URL}/fapi/v1/klines"
@@ -797,39 +1051,99 @@ def get_trend_strength(symbol="BTC/USDT"):
         response = requests.get(endpoint, params=params).json()
         closes = np.array([float(entry[4]) for entry in response])  # Extract closing prices
 
-        # Compute short-term (10-period) and long-term (50-period) moving averages
+        # Compute moving averages
         short_ma = np.mean(closes[-10:])  # Short-term trend (10 periods)
         long_ma = np.mean(closes)  # Long-term trend (50 periods)
 
-        # Compute trend strength as a percentage difference
+        # Compute trend strength as a capped percentage difference
         trend_strength = ((short_ma - long_ma) / long_ma) * 100
 
-        return round(trend_strength, 2)  # Return trend strength as a percentage
+        return round(min(max(trend_strength, -5), 5), 2)  # Cap trend strength between [-5%, +5%]
 
     except Exception as e:
         print(f"❌ Error Fetching Trend Strength: {e}")
         return 0  # Default to neutral trend if API fails
+
    
 def get_trade_confidence(symbol="BTCUSDT"):
+    """
+    Computes trade confidence based on:
+    - Trend Strength (0.4 weight)
+    - ATR / Price Ratio (0.2 weight)
+    - Fundamental Score (0.3 weight)
+    - Historical Win Rate (0.1 weight, penalized if low trade count)
+    """
+
     weights = {"trend_strength": 0.4, "atr": 0.2, "fundamental": 0.3, "historical_win_rate": 0.1}
     
+    # Fetch individual components
     trend_strength = get_trend_strength(symbol) * weights["trend_strength"]
     atr = (get_atr(symbol) / get_real_time_price(symbol)) * weights["atr"]
-    fundamental_score = get_fundamental_score() * weights["fundamental"]
+    fundamental_score = (get_fundamental_score() / 100) * weights["fundamental"]  # Normalize to [0,1]
     historical_win_rate = get_historical_win_rate(symbol) * weights["historical_win_rate"]
-    
-    confidence = (trend_strength + atr + fundamental_score + historical_win_rate) * 100
-    return round(min(100, max(0, confidence)), 2)
 
+    # Normalize ATR so it doesn't dominate confidence
+    atr = min(max(atr, 0), 0.05)  # Cap ATR contribution to avoid over-scaling
+
+    # Compute overall confidence
+    confidence = (abs(trend_strength) + atr + fundamental_score + historical_win_rate) * 100
+
+    return round(min(100, max(0, confidence)), 2)  # Ensure confidence is between [0,100]
+
+def check_circuit_breaker():
+    global consecutive_losses
+    current_balance = float(binance.fetch_balance({"type": "future"})["info"]["totalWalletBalance"])
+
+    # **Circuit Breaker 1: Stop if balance drops by 20%** ✅
+    if current_balance < INITIAL_BALANCE * 0.8:
+        print(f"🚨 Circuit Breaker Activated! Balance Dropped by 20% ({current_balance}). Stopping Trading!")
+        return True
+
+    # **Circuit Breaker 2: Stop if 3 consecutive losses** ✅
+    if consecutive_losses >= 3:
+        print(f"🚨 Circuit Breaker Activated! 3 Consecutive Losses Detected. Stopping Trading!")
+        return True
+    return False
+
+def get_whale_activity(symbol="BTCUSDT", spike_threshold=1.5):
+    try:
+        # Fetch current 24H trading volume from Binance
+        endpoint = "https://api.binance.com/api/v3/ticker/24hr"
+        response = requests.get(endpoint, params={"symbol": symbol}).json()
+        current_btc_volume = float(response["volume"])  # Current 24H BTC volume
+
+        # Fetch last 7 days of daily BTC volumes from Binance historical data API
+        history_endpoint = "https://api.binance.com/api/v3/klines"
+        params = {
+            "symbol": symbol,
+            "interval": "1d",  # Daily data
+            "limit": 7  # Fetch last 7 days
+        }
+        history_response = requests.get(history_endpoint, params=params).json()
+
+        # Extract the daily trading volumes (BTC) for the last 7 days
+        historical_volumes = [float(day[5]) for day in history_response]  # day[5] = daily BTC volume
+
+        # Calculate the historical average volume
+        historical_avg_btc_volume = np.mean(historical_volumes) if historical_volumes else current_btc_volume
+
+        # Compute Whale Activity %
+        whale_activity_percent = (current_btc_volume / historical_avg_btc_volume) * 100
+
+        # Determine Whale Activity Level
+        whale_activity = "HIGH" if whale_activity_percent >= spike_threshold * 100 else "LOW"
+
+        return whale_activity
+
+    except Exception as e:
+        print(f"❌ Error Fetching Whale Activity: {e}")
+        return "LOW"
+    
 # Function to place an AI-driven trade with corrected trade direction
 def place_ai_trade(symbol="BTC/USDT"):
     predicted_price, current_price = predict_price_movement(symbol)
     sentiment_score = get_combined_news_sentiment()
     support, resistance = get_support_resistance(symbol)
-
-    if sentiment_score < 0:
-        print("⚠️ FA Signals Bearish Market, Skipping Trade")
-        return
 
     if predicted_price > current_price:
         side = "BUY"
@@ -837,6 +1151,49 @@ def place_ai_trade(symbol="BTC/USDT"):
     else:
         side = "SELL"
         position_side = "SHORT"
+    
+    should_dca_now, dca_size = should_dca(symbol)
+    
+    confidence = get_trade_confidence(symbol)
+
+    print(f"""
+    📊 Market Analysis:
+    - Trade Confidence {confidence:,.2f}
+    - 🔹 Whale Activity: {get_whale_activity()}
+    """)
+
+    position_size = dca_size if should_dca_now else get_trade_size(symbol)
+    stop_loss, take_profit = get_dynamic_sl_tp(symbol, entry_price, side, predicted_price)
+
+    # ✅ Get Optimal Entry Price Using Order Book Data
+    entry_price = get_optimal_entry(symbol, side)
+
+    order_type = "LIMIT"
+
+    print(f"🚀 AI Trading Signal: {side} | Order Amount: {position_size:.6f} BTC | Entry Price: {entry_price:.2f} | SL: {stop_loss:.2f} | TP: {take_profit:.2f} | Mode: Hedge")
+    
+    if sentiment_score < 0:
+        print("⚠️ FA Signals Bearish Market, Skipping Trade")
+        return
+
+    if side == "BUY" and current_price >= resistance * 0.99:
+        print(f"⚠️ Skipping Trade: {symbol} is near resistance at {resistance:.2f}")
+        return
+    if side == "SELL" and current_price <= support * 1.01:
+        print(f"⚠️ Skipping Trade: {symbol} is near support at {support:.2f}")
+        return
+
+    if not is_profitable_setup(symbol, side):
+        print(f"⚠️ Skipping Trade: Similar setups had <60% win rate")
+        return
+
+    if confidence < 75:
+        print(f"⚠️ Skipping Trade: Confidence too low ({confidence}%)")
+        return
+    
+    if sentiment_score < 0:
+        print("⚠️ FA Signals Bearish Market, Skipping Trade")
+        return
 
     if side == "BUY" and current_price >= resistance * 0.99:
         print(f"⚠️ Skipping Trade: {symbol} is near resistance at {resistance:.2f}")
@@ -854,33 +1211,25 @@ def place_ai_trade(symbol="BTC/USDT"):
         print(f"⚠️ Skipping Trade: Confidence too low ({confidence}%)")
         return
 
-    should_dca_now, dca_size = should_dca(symbol)
-
     if open_trades and not should_dca_now:
         print(f"⚠️ Skipping Trade: Already an Open Position for {symbol}")
         return False, 0
-
-    inflow, buy_volume = get_whale_exchange_flows()
-
-    print(f"""
-    📊 Market Analysis:
-    - Trade Confidence {confidence:,.2f}
-    - 🔹 Whale Activity: {"HIGH" if buy_volume > 10_000 else "LOW"}
-    """)
-
-    position_size = dca_size if should_dca_now else get_trade_size(symbol)
-    stop_loss, take_profit = get_dynamic_sl_tp(symbol, current_price, side)
-
+    
     if stop_loss is None or take_profit is None:
         print(f"❌ Error: Stop-Loss or Take-Profit calculation failed. Skipping trade.")
         return
+    
+    risk = abs(entry_price - stop_loss)
+    reward = abs(take_profit - entry_price)
+    rrr = reward / risk if risk > 0 else 0
 
-    # ✅ Get Optimal Entry Price Using Order Book Data
-    entry_price = get_optimal_entry(symbol)
+    print(f"📊 RRR Calculation: Risk = {risk:.2f}, Reward = {reward:.2f}, RRR = {rrr:.2f}")
 
-    order_type = "LIMIT"
+    if rrr < 2.0:
+        print(f"❌ Trade Rejected: RRR {rrr:.2f} is too low (needs at least 2:1).")
+        return
 
-    print(f"🚀 AI Trading Signal: {side} | Order Amount: {position_size:.6f} BTC | Entry Price: {entry_price:.2f} | SL: {stop_loss:.2f} | TP: {take_profit:.2f} | Mode: Hedge")
+    print(f"✅ Trade Approved: RRR {rrr:.2f} meets requirements!")
 
     headers = {"X-MBX-APIKEY": API_KEY}
 
@@ -932,6 +1281,7 @@ def place_ai_trade(symbol="BTC/USDT"):
 
         tp_order_params["signature"] = generate_signature(tp_order_params)
         tp_response = requests.post(f"{BINANCE_FUTURES_URL}/fapi/v1/order", headers=headers, params=tp_order_params)
+        play_sound()
         print(f"✅ Take-Profit Order Executed: {tp_response.json()}")
 
 def get_support_resistance(symbol="BTC/USDT", lookback=50):
@@ -1005,7 +1355,9 @@ trade_monitor_thread.start()
 
 while True:
     print("🔄 Checking Market for AI Trade Signal...")
-    place_ai_trade()
+    if not check_circuit_breaker():
+        place_ai_trade("BTC/USDT")
     """Periodically checks for unfilled limit orders and adjusts them if necessary."""
     check_unfilled_orders()
-    time.sleep(get_market_volatility())
+    volatility, price_change_pct = get_market_volatility()
+    time.sleep(volatility)
