@@ -27,7 +27,7 @@ model.compile(optimizer="adam", loss="mse", metrics=["mae"])
 history = model.fit(X_train, y_train, epochs=100, batch_size=64, validation_data=(X_test, y_test))
 
 # Save Model
-model.save("optimized_4h_lstm_model.h5")
+model.save("larger_1h_lstm_model.h5")
 
 # Evaluate Model
 y_pred = model.predict(X_test)

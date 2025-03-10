@@ -4,7 +4,7 @@ from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 
 # Load Data
-file_path = "btc_usdt_4h_technical_large.csv"  # Ensure the correct file path
+file_path = "btc_usdt_1h_technical_larger.csv"  # Ensure the correct file path
 df = pd.read_csv(file_path)
 
 # Select Features (Price + Indicators)
